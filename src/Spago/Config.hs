@@ -12,6 +12,7 @@ module Spago.Config
 import           Spago.Prelude
 
 import qualified Data.List             as List
+import qualified Data.List.NonEmpty    as NonEmpty
 import qualified Data.Map              as Map
 import qualified Data.SemVer           as SemVer
 import qualified Data.Sequence         as Seq
@@ -42,6 +43,7 @@ data Config = Config
   { name              :: Text
   , dependencies      :: [PackageName]
   , packageSet        :: PackageSet
+  , alternateBackend  :: Maybe Text
   , configSourcePaths :: [Purs.SourcePath]
   , publishConfig     :: Either (Dhall.ReadError Dhall.TypeCheck.X) PublishConfig
   } deriving (Show, Generic)
@@ -96,10 +98,10 @@ parsePackage (Dhall.App (Dhall.Field union "Local") (Dhall.TextLit (Dhall.Chunks
             Dhall.inputWithSettings
               (set Dhall.rootDirectory (Text.unpack localPath) Dhall.defaultInputSettings)
               dependenciesType
-              (Dhall.pretty newExpr)
+              (pretty newExpr)
       let location = PackageSet.Local{..}
       pure PackageSet.Package{..}
-parsePackage expr = die $ Messages.failedToParsePackage $ Dhall.pretty expr
+parsePackage expr = die $ Messages.failedToParsePackage $ pretty expr
 
 
 -- | Tries to read in a Spago Config
@@ -122,6 +124,7 @@ parseConfig = do
       name              <- Dhall.requireTypedKey ks "name" Dhall.strictText
       dependencies      <- Dhall.requireTypedKey ks "dependencies" dependenciesType
       configSourcePaths <- Dhall.requireTypedKey ks "sources" sourcesType
+      alternateBackend  <- Dhall.maybeTypedKey ks "backend" Dhall.strictText
 
       let ensurePublishConfig = do
             publishLicense    <- Dhall.requireTypedKey ks "license" Dhall.strictText
@@ -132,14 +135,14 @@ parseConfig = do
       let metadataPackageName = PackageSet.PackageName "metadata"
       let (metadataMap, packagesDB) = Map.partitionWithKey (\k _v -> k == metadataPackageName) packages
       let packagesMinPursVersion = join
-            $ fmap (hush . Version.semver . (Text.replace "v" "") . PackageSet.version . PackageSet.location)
+            $ fmap (hush . Version.semver . Text.replace "v" "" . PackageSet.version . PackageSet.location)
             $ Map.lookup metadataPackageName metadataMap
       let packageSet = PackageSet.PackageSet{..}
 
       pure Config{..}
     _ -> case Dhall.TypeCheck.typeOf expr of
       Right e  -> throwM $ Dhall.ConfigIsNotRecord e
-      Left err -> throwM $ err
+      Left err -> throwM err
 
 
 -- | Checks that the Spago config is there and readable
@@ -148,23 +151,23 @@ ensureConfig = do
   path <- asks globalConfigPath
   exists <- testfile path
   unless exists $ do
-    die $ Messages.cannotFindConfig
+    die Messages.cannotFindConfig
   try parseConfig >>= \case
     Right config -> do
-      PackageSet.ensureFrozen
+      PackageSet.ensureFrozen $ Text.unpack path
       pure config
     Left (err :: Dhall.ReadError Dhall.TypeCheck.X) -> throwM err
 
 
 -- | Copies over `spago.dhall` to set up a Spago project.
 --   Eventually ports an existing `psc-package.json` to the new config.
-makeConfig :: Spago m => Bool -> m ()
-makeConfig force = do
+makeConfig :: Spago m => Bool -> Dhall.TemplateComments -> m ()
+makeConfig force comments = do
   path <- asks globalConfigPath
   unless force $ do
     hasSpagoDhall <- testfile path
     when hasSpagoDhall $ die $ Messages.foundExistingProject path
-  writeTextFile path Templates.spagoDhall
+  writeTextFile path $ Dhall.processComments comments Templates.spagoDhall
   Dhall.format path
 
   -- We try to find an existing psc-package or Bower config, and if
@@ -255,7 +258,7 @@ showBowerErrors (List.sort -> errors)
   = "\n\nSpago encountered some errors while trying to migrate your Bower config.\n"
   <> "A Spago config has been generated but it's recommended that you apply the suggestions here\n\n"
   <> (Text.unlines $ map (\errorGroup ->
-      (case (head errorGroup) of
+      (case head errorGroup of
          UnparsableRange _ _ -> "It was not possible to parse the version range for these packages:"
          NonPureScript _ -> "These packages are not PureScript packages, so you should install them with `npm` instead:"
          MissingFromTheSet _ -> "These packages are missing from the package set. You should add them in your local package set:\n(See here for how: https://github.com/spacchetti/spago#add-a-package-to-the-package-set)"
@@ -282,31 +285,34 @@ updateName newName (Dhall.RecordLit kvs)
 updateName _ other = other
 
 addRawDeps :: Spago m => Config -> [PackageName] -> Expr -> m Expr
-addRawDeps config newPackages r@(Dhall.RecordLit kvs)
-  | Just (Dhall.ListLit _ dependencies) <- Dhall.Map.lookup "dependencies" kvs = do
-      case notInPackageSet of
+addRawDeps config newPackages r@(Dhall.RecordLit kvs) = case Dhall.Map.lookup "dependencies" kvs of
+  Just (Dhall.ListLit _ dependencies) -> do
+      case NonEmpty.nonEmpty notInPackageSet of
         -- If none of the newPackages are outside of the set, add them to existing dependencies
-        [] -> do
+        Nothing -> do
           oldPackages <- traverse (throws . Dhall.fromTextLit) dependencies
           let newDepsExpr
                 = Dhall.ListLit Nothing $ fmap (Dhall.toTextLit . PackageSet.packageName)
                 $ Seq.sort $ nubSeq (Seq.fromList newPackages <> fmap PackageSet.PackageName oldPackages)
           pure $ Dhall.RecordLit $ Dhall.Map.insert "dependencies" newDepsExpr kvs
-        pkgs -> do
-          echo $ Messages.failedToAddDeps $ map PackageSet.packageName pkgs
+        Just pkgs -> do
+          echo $ Messages.failedToAddDeps $ NonEmpty.map PackageSet.packageName pkgs
           pure r
-  where
-    notInPackageSet = mapMaybe
-      (\p -> case Map.lookup p (PackageSet.packagesDB $ packageSet config) of
-               Just _  -> Nothing
-               Nothing -> Just p)
-      newPackages
+    where
+      packagesDB = PackageSet.packagesDB $ packageSet config
+      notInPackageSet = filter (\p -> Map.notMember p packagesDB) newPackages
 
-    -- | Code from https://stackoverflow.com/questions/45757839
-    nubSeq :: Ord a => Seq a -> Seq a
-    nubSeq xs = (fmap fst . Seq.filter (uncurry notElem)) (Seq.zip xs seens)
-      where
-        seens = Seq.scanl (flip Set.insert) Set.empty xs
+      -- | Code from https://stackoverflow.com/questions/45757839
+      nubSeq :: Ord a => Seq a -> Seq a
+      nubSeq xs = (fmap fst . Seq.filter (uncurry notElem)) (Seq.zip xs seens)
+        where
+          seens = Seq.scanl (flip Set.insert) Set.empty xs
+  Just _ -> do
+    echo "WARNING: Failed to add dependencies. The `dependencies` field wasn't a List of Strings."
+    pure r
+  Nothing -> do
+    echo "WARNING: Failed to add dependencies. You should have a record with the `dependencies` key for this to work."
+    pure r
 addRawDeps _ _ other = pure other
 
 addSourcePaths :: Expr -> Expr
@@ -371,5 +377,5 @@ transformMExpr rules =
 addDependencies :: Spago m => Config -> [PackageName] -> m ()
 addDependencies config newPackages = do
   configHasChanged <- withConfigAST $ addRawDeps config newPackages
-  when (not configHasChanged) $ do
-    echo "WARNING: configuration file was not updated. You should have a record with the `dependencies` key for this to work."
+  unless configHasChanged $
+    echo "WARNING: configuration file was not updated."

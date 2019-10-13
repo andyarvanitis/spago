@@ -6,19 +6,66 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+Breaking changes (😱!!!):
+- **Remove `psc-package`-related commands (#423)**
+
+  Since `psc-package` is now deprecated, we no longer support the 
+  `psc-package-local-setup`, `psc-package-insdhall` and `psc-package-clean` commands.
+
+New features:
+- `spago docs` now displays a link to the generated docs' `index.html` (#379)
+- `spago docs` has new `--open` flag, which opens generated docs in browser (#379)
+- added support for building with alternate backends (#355). E.g: Use `backend = "psgo"` entry in `spago.dhall` to compile with `psgo`
+- `spago init` has new `--no-comments` flag which skips adding tutorial comments to the generated `spago.dhall` and `packages.dhall` files (#417)
+- `spago verify-set` now compiles everything, to detect duplicate module names (#438)
+- `spago build` now uses shared output folder to reduce build duplication. Pass `--no-share-output` flag to disable this behavior (#377)
+- `spago install purescript-XYZ` will now strip `purescript-` prefix and install XYZ (if it exists in package set) instead of just failing with a warning (#367)
+- `spago run` now recognizes backend specified in the configuration file and calls the backend with `--run` argument.
+
+Bugfixes:
+- Warn (but don't error) when trying to watch missing directories (#406)
+- Fix confusing warning when trying to `spago install` a package already present in project dependencies list (#436)
+- Do not watch files in `.spago` folder when running `spago build --watch` (#430)
+- Fix dynamic libraries compatibility problems by publishing a statically linked executable for Linux (#427, #437)
+
+Other improvements:
+- Speed up test suite by replacing couple of end 2 end bump-version tests with unit/property tests
+
+## [0.10.0] - 2019-09-21
+
 Breaking changes (!!!):
-- **Flags and arguments that you want to give to `purs` are now passed with `--purs-args`**
+- **Flags and arguments that you want to give to `purs` are now passed with `--purs-args` (#353, #366)**
 
   The previous behaviour in which all arguments that could not parse as `spago` arguments
   were passed along to `purs` was sometimes confusing (e.g. when using `--path` and multiple
   arguments).
 
+New features:
+- Support watching js files (#407, #205)
+- New `--no-search` flag for `spago docs` to skip patching the documentation using `purescript-docs-search` (#400)
+- New `-x` flag for specifying the config path location (#357, #329)
+- New `spago login` command, to save a GitHub token to the cache so it can be used for various operations hitting GitHub (#391, #403)
+
 Bugfixes:
-- Do not compile files twice when using `--watch` and Vim (#346)
-- fix Dhall syntax error in packages.dhall template
-- Use `git clone` instead of `git fetch` when fetching a package (#373)
-- Fixes Windows global cache location; now uses `LocalAppData` as default (#384, #380)
-- Fix failure to copy to global cache on a different filesystem (#385)
+- "Quit" command in watch mode now actually quits (#390, #389)
+- Do not compile files twice when using `--watch` and Vim (#346, #371)
+- Use `git clone` instead of `git fetch` when fetching a package, so all tags can be installed (#373, #374)
+- Fix Windows global cache location; now uses `LocalAppData` as default (#384, #380)
+- Fix naming clash in short flag for repl dependencies (#352, #350)
+- Fix failure to copy to global cache on a different filesystem (#385, #386)
+- Fix watch function on Windows (issue with paths) (#387, #380, #401)
+- Look up remote imports dynamically when doing frozen check, to always find the right `packages.dhall` (#349, #402)
+
+Other Improvements:
+- Performance: make no-op `spago install` faster (#409, #412)
+- CI: remove reviews limitation on mergify (#354)
+- CI: various fixes (#362, #368, #382, #388, #418)
+- Docs: fix syntax errors in template comment (#369, #413, #408)
+- Docs: fix link for package-set from commit (#405)
+- Docs: keep README up to date with new features (#398, #347)
+- Deps: upgrade to lts-14 and GHC-8.6 (#395)
+- Deps: upgrade to dhall-1.26.0, v10 of the standard (#411, #358)
 
 ## [0.9.0] - 2019-07-30
 

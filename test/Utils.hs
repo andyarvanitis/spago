@@ -24,15 +24,13 @@ import           Prelude            hiding (FilePath)
 import           System.Directory   (removePathForcibly)
 import qualified System.Process     as Process
 import           Test.Hspec         (HasCallStack, shouldBe, shouldSatisfy)
-import           Turtle             (ExitCode (..), FilePath, Text, cd, empty,
-                                     encodeString, inproc, limit,
-                                     procStrictWithErr, pwd, readTextFile,
-                                     strict)
+import           Turtle             (ExitCode (..), FilePath, Text, cd, empty, encodeString, inproc,
+                                     limit, procStrictWithErr, pwd, readTextFile, strict)
 
 withCwd :: FilePath -> IO () -> IO ()
 withCwd dir cmd = do
   oldDir <- pwd
-  Exception.bracket (cd dir) (const $ cd oldDir) (const cmd)
+  Exception.bracket_ (cd dir) (cd oldDir) cmd
 
 spago :: [Text] -> IO (ExitCode, Text, Text)
 spago args =
@@ -55,13 +53,15 @@ shouldBeSuccess result@(_code, _stdout, _stderr) = do
   result `shouldSatisfy` (\(code, _, _) -> code == ExitSuccess)
 
 shouldBeSuccessOutput :: HasCallStack => FilePath -> (ExitCode, Text, Text) -> IO ()
-shouldBeSuccessOutput expected result = do
-  expectedContent <- readFixture expected
-  result `shouldSatisfy` (\(code, stdout, _stderr) -> code == ExitSuccess && stdout == expectedContent)
+shouldBeSuccessOutput expected (code, stdout, _stderr) = do
+  expectedStdout <- readFixture expected
+  code `shouldBe` ExitSuccess
+  stdout `shouldBe` expectedStdout
 
 shouldBeSuccessInfix :: HasCallStack => Text -> (ExitCode, Text, Text) -> IO ()
-shouldBeSuccessInfix expected result =
-  result `shouldSatisfy` (\(code, stdout, _stderr) -> code == ExitSuccess && Text.isInfixOf expected stdout)
+shouldBeSuccessInfix expected (code, stdout, _stderr) = do
+  code `shouldBe` ExitSuccess
+  stdout `shouldSatisfy` (Text.isInfixOf expected)
 
 shouldBeEmptySuccess :: HasCallStack => (ExitCode, Text, Text) -> IO ()
 shouldBeEmptySuccess result = do
@@ -74,9 +74,10 @@ shouldBeFailure result@(_code, _stdout, _stderr) = do
   result `shouldSatisfy` (\(code, _, _) -> code == ExitFailure 1)
 
 shouldBeFailureOutput :: HasCallStack => FilePath -> (ExitCode, Text, Text) -> IO ()
-shouldBeFailureOutput expected result = do
+shouldBeFailureOutput expected (code, _stdout, stderr) = do
   expectedContent <- readFixture expected
-  result `shouldSatisfy` (\(code, _stdout, stderr) -> code == ExitFailure 1 && stderr == expectedContent)
+  code `shouldBe` ExitFailure 1
+  stderr `shouldBe` expectedContent
 
 shouldBeFailureInfix :: HasCallStack => Text -> (ExitCode, Text, Text) -> IO ()
 shouldBeFailureInfix expected result = do

@@ -11,20 +11,22 @@ import qualified System.Environment  as Env
 import qualified Turtle              as CLI
 
 import           Spago.Build         (BuildOptions (..), DepsOnly (..), ExtraArg (..),
-                                      ModuleName (..), NoBuild (..), NoInstall (..),
-                                      SourcePath (..), TargetPath (..), Watch (..), WithMain (..))
+                                      ModuleName (..), NoBuild (..), NoInstall (..), NoSearch (..),
+                                      OpenDocs (..), ShareOutput (..), SourcePath (..),
+                                      TargetPath (..), Watch (..), WithMain (..))
 import qualified Spago.Build
 import qualified Spago.Config        as Config
+import           Spago.Dhall         (TemplateComments (..))
 import           Spago.DryRun        (DryRun (..))
+import qualified Spago.GitHub
 import           Spago.GlobalCache   (CacheFlag (..))
 import           Spago.Messages      as Messages
-import           Spago.Packages      (JsonFlag (..), PackagesFilter (..))
+import           Spago.Packages      (CheckModulesUnique (..), JsonFlag (..), PackagesFilter (..))
 import qualified Spago.Packages
-import qualified Spago.PscPackage    as PscPackage
 import qualified Spago.Purs          as Purs
 import           Spago.Types
 import           Spago.Version       (VersionBump (..))
-import qualified Spago.Version       as Version
+import qualified Spago.Version
 import           Spago.Watch         (ClearScreen (..))
 
 
@@ -34,7 +36,7 @@ data Command
   -- | ### Commands for working with Spago projects
   --
   -- | Initialize a new project
-  = Init Bool
+  = Init Bool TemplateComments
 
   -- | Install (download) dependencies defined in spago.dhall
   | Install (Maybe CacheFlag) [PackageName]
@@ -46,7 +48,7 @@ data Command
   | Repl (Maybe CacheFlag) [PackageName] [SourcePath] [ExtraArg] DepsOnly
 
   -- | Generate documentation for the project and its dependencies
-  | Docs (Maybe Purs.DocsFormat) [SourcePath] DepsOnly
+  | Docs (Maybe Purs.DocsFormat) [SourcePath] DepsOnly NoSearch OpenDocs
 
   -- | Build the project paths src/ and test/ plus the specified source paths
   | Build BuildOptions
@@ -58,13 +60,16 @@ data Command
   | Verify (Maybe CacheFlag) PackageName
 
   -- | Verify that the Package Set is correct
-  | VerifySet (Maybe CacheFlag)
+  | VerifySet (Maybe CacheFlag) CheckModulesUnique
 
   -- | Test the project with some module, default Test.Main
   | Test (Maybe ModuleName) BuildOptions [ExtraArg]
 
   -- | Bump and tag a new version in preparation for release.
   | BumpVersion DryRun VersionBump
+
+  -- | Save a GitHub token to cache, to authenticate to various GitHub things
+  | Login
 
   -- | Run the project with some module, default Main
   | Run (Maybe ModuleName) BuildOptions [ExtraArg]
@@ -83,26 +88,6 @@ data Command
   -- | Freeze the package-set so it will be cached
   | Freeze
 
-  -- | ### Commands for working with Psc-Package
-  --
-  --   Do the boilerplate of the local project setup to override and add arbitrary packages
-  --   See the package-sets docs about this here:
-  --   https://github.com/purescript/package-sets
-  | PscPackageLocalSetup Bool
-
-  -- | Do the Ins-Dhall-ation of the local project setup, equivalent to:
-  --   ```sh
-  --   NAME='local'
-  --   TARGET=.psc-package/$NAME/.set/packages.json
-  --   mktree -p .psc-package/$NAME/.set
-  --   dhall-to-json --pretty <<< './packages.dhall' > $TARGET
-  --   echo wrote packages.json to $TARGET
-  --   ```
-  | PscPackageInsDhall
-
-  -- | Deletes the .psc-package folder
-  | PscPackageClean
-
   -- | Runs `purescript-docs-search search`.
   | Search
 
@@ -118,7 +103,7 @@ data Command
 parser :: CLI.Parser (Command, GlobalOptions)
 parser = do
   opts <- globalOptions
-  command <- projectCommands <|> packageSetCommands <|> publishCommands <|> pscPackageCommands <|> otherCommands <|> oldCommands
+  command <- projectCommands <|> packageSetCommands <|> publishCommands <|> otherCommands <|> oldCommands
   pure (command, opts)
   where
     cacheFlag =
@@ -133,14 +118,7 @@ parser = do
             "transitive" -> Just TransitiveDeps
             _            -> Nothing
       in CLI.optional $ CLI.opt wrap "filter" 'f' "Filter packages: direct deps with `direct`, transitive ones with `transitive`"
-    versionBump =
-      let spec = \case
-            "major" -> Just Version.Major
-            "minor" -> Just Version.Minor
-            "patch" -> Just Version.Patch
-            v | Right v' <- Version.parseVersion v -> Just $ Exact v'
-            _ -> Nothing
-      in CLI.arg spec "bump" "How to bump the version. Acceptable values: 'major', 'minor', 'patch', or a version (e.g. 'v1.2.3')."
+    versionBump = CLI.arg Spago.Version.parseVersionBump "bump" "How to bump the version. Acceptable values: 'major', 'minor', 'patch', or a version (e.g. 'v1.2.3')."
 
     force   = CLI.switch "force" 'f' "Overwrite any project found in the current directory"
     verbose = CLI.switch "verbose" 'v' "Enable additional debug logging, e.g. printing `purs` commands"
@@ -149,12 +127,16 @@ parser = do
     watch       = bool BuildOnce Watch <$> CLI.switch "watch" 'w' "Watch for changes in local files and automatically rebuild"
     noInstall   = bool DoInstall NoInstall <$> CLI.switch "no-install" 'n' "Don't run the automatic installation of packages"
     depsOnly    = bool AllSources DepsOnly <$> CLI.switch "deps-only" 'd' "Only use sources from dependencies, skipping the project sources."
+    noSearch    = bool AddSearch NoSearch <$> CLI.switch "no-search" 'S' "Do not make the documentation searchable"
     clearScreen = bool NoClear DoClear <$> CLI.switch "clear-screen" 'l' "Clear the screen on rebuild (watch mode only)"
     noBuild     = bool DoBuild NoBuild <$> CLI.switch "no-build" 's' "Skip build step"
     jsonFlag    = bool JsonOutputNo JsonOutputYes <$> CLI.switch "json" 'j' "Produce JSON output"
     dryRun      = bool DryRun NoDryRun <$> CLI.switch "no-dry-run" 'f' "Actually perform side-effects (the default is to describe what would be done)"
     usePsa      = bool UsePsa NoPsa <$> CLI.switch "no-psa" 'P' "Don't build with `psa`, but use `purs`"
+    openDocs    = bool NoOpenDocs DoOpenDocs <$> CLI.switch "open" 'o' "Open generated documentation in browser (for HTML format only)"
+    noComments  = bool WithComments NoComments <$> CLI.switch "no-comments" 'C' "Generate package.dhall and spago.dhall files without tutorial comments"
     configPath  = CLI.optional $ CLI.optText "config" 'x' "Optional config path to be used instead of the default spago.dhall"
+    chkModsUniq = bool DoCheckModulesUnique NoCheckModulesUnique <$> CLI.switch "no-check-modules-unique" 'M' "Skip checking whether modules names are unique across all packages."
 
     mainModule  = CLI.optional $ CLI.opt (Just . ModuleName) "main" 'm' "Module to be used as the application's entry point"
     toTarget    = CLI.optional $ CLI.opt (Just . TargetPath) "to" 't' "The target file path"
@@ -167,8 +149,8 @@ parser = do
     packageName     = CLI.arg (Just . PackageName) "package" "Specify a package name. You can list them with `list-packages`"
     packageNames    = many $ CLI.arg (Just . PackageName) "package" "Package name to add as dependency"
     pursArgs        = many $ CLI.opt (Just . ExtraArg) "purs-args" 'u' "Argument to pass to purs"
-
-    buildOptions  = BuildOptions <$> cacheFlag <*> watch <*> clearScreen <*> sourcePaths <*> noInstall <*> pursArgs <*> depsOnly
+    useSharedOutput = bool ShareOutput NoShareOutput <$> CLI.switch "no-share-output" 'S' "Disabled using a shared output folder in location of root packages.dhall"
+    buildOptions  = BuildOptions <$> cacheFlag <*> watch <*> clearScreen <*> sourcePaths <*> noInstall <*> pursArgs <*> depsOnly <*> useSharedOutput
 
     -- Note: by default we limit concurrency to 20
     globalOptions = GlobalOptions <$> verbose <*> usePsa <*> fmap (fromMaybe 20) jobsLimit <*> fmap (fromMaybe Config.defaultPath) configPath
@@ -188,7 +170,7 @@ parser = do
     initProject =
       ( "init"
       , "Initialize a new sample project, or migrate a psc-package one"
-      , Init <$> force
+      , Init <$> force <*> noComments
       )
 
     build =
@@ -230,7 +212,7 @@ parser = do
     docs =
       ( "docs"
       , "Generate docs for the project and its dependencies"
-      , Docs <$> docsFormat <*> sourcePaths <*> depsOnly
+      , Docs <$> docsFormat <*> sourcePaths <*> depsOnly <*> noSearch <*> openDocs
       )
 
     search =
@@ -276,7 +258,7 @@ parser = do
     verifySet =
       ( "verify-set"
       , "Verify that the whole Package Set builds correctly"
-      , VerifySet <$> cacheFlag
+      , VerifySet <$> cacheFlag <*> chkModsUniq
       )
 
     upgradeSet =
@@ -293,40 +275,21 @@ parser = do
 
 
     publishCommands = CLI.subcommandGroup "Publish commands:"
-      [ bumpVersion
+      [ login
+      , bumpVersion
       ]
+
+    login =
+      ( "login"
+      , "Save the GitHub token to the global cache - set it with the SPAGO_GITHUB_TOKEN env variable"
+      , pure Login
+      )
 
     bumpVersion =
       ( "bump-version"
       , "Bump and tag a new version, and generate bower.json, in preparation for release."
       , BumpVersion <$> dryRun <*> versionBump
       )
-
-
-    pscPackageCommands = CLI.subcommandGroup "Psc-Package compatibility commands:"
-      [ pscPackageLocalSetup
-      , pscPackageInsDhall
-      , pscPackageClean
-      ]
-
-    pscPackageLocalSetup =
-      ( "psc-package-local-setup"
-      , "Setup a local package set by creating a new packages.dhall"
-      , PscPackageLocalSetup <$> force
-      )
-
-    pscPackageInsDhall =
-      ( "psc-package-insdhall"
-      , "Insdhall the local package set from packages.dhall"
-      , pure PscPackageInsDhall
-      )
-
-    pscPackageClean =
-      ( "psc-package-clean"
-      , "Clean cached packages by deleting the .psc-package folder"
-      , pure PscPackageClean
-      )
-
 
     otherCommands = CLI.subcommandGroup "Other commands:"
       [ version
@@ -348,6 +311,11 @@ parser = do
       Opts.command "make-module" $ Opts.info (MakeModule <$ mainModule <* toTarget <* noBuild <* buildOptions) mempty
 
 
+-- | Print out Spago version
+printVersion :: Spago m => m ()
+printVersion = CLI.echo $ CLI.unsafeTextToLine $ Text.pack $ showVersion Pcli.version
+
+
 main :: IO ()
 main = do
   -- We always want to run in UTF8 anyways
@@ -357,23 +325,21 @@ main = do
   -- https://serverfault.com/questions/544156
   Env.setEnv "GIT_TERMINAL_PROMPT" "0"
 
-  -- | Print out Spago version
-  let printVersion = CLI.echo $ CLI.unsafeTextToLine $ Text.pack $ showVersion Pcli.version
-
   (command, globalOptions) <- CLI.options "Spago - manage your PureScript projects" parser
-  (flip runReaderT) globalOptions $
+  flip runReaderT globalOptions $
     case command of
-      Init force                            -> Spago.Packages.initProject force
+      Init force noComments                 -> Spago.Packages.initProject force noComments
       Install cacheConfig packageNames      -> Spago.Packages.install cacheConfig packageNames
       ListPackages packagesFilter jsonFlag  -> Spago.Packages.listPackages packagesFilter jsonFlag
       Sources                               -> Spago.Packages.sources
-      Verify cacheConfig package            -> Spago.Packages.verify cacheConfig (Just package)
-      VerifySet cacheConfig                 -> Spago.Packages.verify cacheConfig Nothing
+      Verify cacheConfig package            -> Spago.Packages.verify cacheConfig NoCheckModulesUnique (Just package)
+      VerifySet cacheConfig chkModsUniq     -> Spago.Packages.verify cacheConfig chkModsUniq Nothing
       PackageSetUpgrade                     -> Spago.Packages.upgradePackageSet
-      Freeze                                -> Spago.Packages.freeze
+      Freeze                                -> Spago.Packages.freeze Spago.Packages.packagesPath
       Build buildOptions                    -> Spago.Build.build buildOptions Nothing
       Test modName buildOptions nodeArgs    -> Spago.Build.test modName buildOptions nodeArgs
-      BumpVersion dryRun spec               -> Version.bumpVersion dryRun spec
+      BumpVersion dryRun spec               -> Spago.Version.bumpVersion dryRun spec
+      Login                                 -> Spago.GitHub.login
       Run modName buildOptions nodeArgs     -> Spago.Build.run modName buildOptions nodeArgs
       Repl cacheConfig replPackageNames paths pursArgs depsOnly
         -> Spago.Build.repl cacheConfig replPackageNames paths pursArgs depsOnly
@@ -381,11 +347,9 @@ main = do
         -> Spago.Build.bundleApp WithMain modName tPath shouldBuild buildOptions
       BundleModule modName tPath shouldBuild buildOptions
         -> Spago.Build.bundleModule modName tPath shouldBuild buildOptions
-      Docs format sourcePaths depsOnly      -> Spago.Build.docs format sourcePaths depsOnly
+      Docs format sourcePaths depsOnly noSearch openDocs
+        -> Spago.Build.docs format sourcePaths depsOnly noSearch openDocs
       Search                                -> Spago.Build.search
       Version                               -> printVersion
-      PscPackageLocalSetup force            -> PscPackage.localSetup force
-      PscPackageInsDhall                    -> PscPackage.insDhall
-      PscPackageClean                       -> PscPackage.clean
       Bundle                                -> die Messages.bundleCommandRenamed
       MakeModule                            -> die Messages.makeModuleCommandRenamed

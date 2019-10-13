@@ -2,10 +2,12 @@
 Welcome to a Spago project!
 You can edit this file as you like.
 -}
-{ name =
+{ backend =
+    "echo hi from backend> alternate-backend-output.txt"
+, name =
     "aaa"
 , dependencies =
-    [ "console", "effect", "psci-support" ]
+    [ "aff", "console", "effect", "psci-support" ]
 , packages =
     ./packages.dhall
 , sources =

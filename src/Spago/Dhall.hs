@@ -6,6 +6,7 @@ module Spago.Dhall
 
 import           Spago.Prelude
 
+import qualified Control.Monad.Trans.State.Strict      as State
 import qualified Data.Text                             as Text
 import qualified Data.Text.Prettyprint.Doc             as Pretty
 import qualified Data.Text.Prettyprint.Doc.Render.Text as PrettyText
@@ -17,6 +18,7 @@ import qualified Dhall.Map
 import qualified Dhall.Parser                          as Parser
 import qualified Dhall.Pretty
 import           Dhall.TypeCheck                       (X, typeOf)
+import qualified Lens.Family
 
 type DhallExpr a = Dhall.Expr Parser.Src a
 
@@ -33,17 +35,44 @@ format pathText = liftIO $
     path = Just $ Text.unpack pathText
 
 
--- | Prettyprint a Dhall expression
-pretty :: Pretty.Pretty a => DhallExpr a -> Dhall.Text
-pretty = PrettyText.renderStrict
-  . Pretty.layoutPretty Pretty.defaultLayoutOptions
-  . Pretty.pretty
-
 -- | Prettyprint a Dhall expression adding a comment on top
 prettyWithHeader :: Pretty.Pretty a => Text -> DhallExpr a -> Dhall.Text
 prettyWithHeader header expr = do
   let doc = Pretty.pretty header <> Pretty.pretty expr
   PrettyText.renderStrict $ Pretty.layoutSmart Pretty.defaultLayoutOptions doc
+
+data TemplateComments = WithComments | NoComments
+
+processComments :: TemplateComments -> Text -> Text
+processComments WithComments = id
+processComments NoComments   = stripComments
+
+stripComments :: Text -> Text
+stripComments dhallSrc =
+  -- This is a hack taking advantage of current Dhall's parser behavior which does not preserve comments
+  -- This impl might need to be revisited after https://github.com/dhall-lang/dhall-haskell/issues/145 is fixed
+  case Parser.exprFromText mempty dhallSrc of
+    Left _     -> dhallSrc
+    Right expr -> pretty expr
+
+
+-- | Return a list of all imports starting from a particular file
+readImports :: Text -> IO [Dhall.Import]
+readImports pathText = do
+  fileContents <- readTextFile $ pathFromText pathText
+  expr <- throws $ Parser.exprFromText mempty fileContents
+  status <- load expr
+  let graph = Lens.Family.view Dhall.Import.graph status
+  pure $ childImport <$> graph
+  where
+    load expr
+      = State.execStateT
+          (Dhall.Import.loadWith expr)
+          (Dhall.Import.emptyStatus ".")
+
+    childImport
+      = Dhall.Import.chainedImport . Dhall.Import.child
+
 
 
 readRawExpr :: Text -> IO (Maybe (Text, DhallExpr Dhall.Import))
@@ -53,7 +82,7 @@ readRawExpr pathText = do
     then (do
       packageSetText <- readTextFile $ pathFromText pathText
       fmap Just $ throws $ Parser.exprAndHeaderFromText mempty packageSetText)
-    else (pure Nothing)
+    else pure Nothing
 
 
 writeRawExpr :: Text -> (Text, DhallExpr Dhall.Import) -> IO ()
@@ -77,7 +106,7 @@ fromTextLit
   => DhallExpr a
   -> Either (ReadError a) Text
 fromTextLit(Dhall.TextLit (Dhall.Chunks [] str)) = Right str
-fromTextLit expr                                  = Left $ ExprIsNotTextLit expr
+fromTextLit expr                                 = Left $ ExprIsNotTextLit expr
 
 
 -- | Require a key from a Dhall.Map, and run an action on it if found.
@@ -88,7 +117,7 @@ requireKey
   -> Text
   -> (DhallExpr b -> m a)
   -> m a
-requireKey ks name f = case (Dhall.Map.lookup name ks) of
+requireKey ks name f = case Dhall.Map.lookup name ks of
   Just v  -> f v
   Nothing -> throwM (RequiredKeyMissing name ks)
 
@@ -104,6 +133,20 @@ requireTypedKey ks name typ = requireKey ks name $ \expr -> case Dhall.extract t
   Success v -> pure v
   Failure _ -> throwM $ RequiredKeyMissing name ks
 
+-- | Try to find a key from a Dhall.Map, and automagically decode the value with the given Dhall.Type
+--   If not found, return `Nothing`, if type is incorrect throw error
+maybeTypedKey
+  :: (MonadIO m, MonadThrow m)
+  => Dhall.Map.Map Text (DhallExpr Dhall.TypeCheck.X)
+  -> Text
+  -> Dhall.Type a
+  -> m (Maybe a)
+maybeTypedKey ks name typ = typify `mapM` Dhall.Map.lookup name ks
+  where
+    typify expr = case Dhall.extract typ expr of
+      Success v -> pure v
+      Failure a -> throwM a
+
 
 -- | Convert a Dhall expression to a given Dhall type
 --
@@ -118,7 +161,7 @@ coerceToType typ expr = do
   let checkedType = typeOf annot
   case (Dhall.extract typ $ Dhall.normalize annot, checkedType) of
     (Success x, Right _) -> Right x
-    _                 -> Left $ WrongType typ expr
+    _                    -> Left $ WrongType typ expr
 
 
 -- | Spago configuration cannot be read
@@ -155,7 +198,7 @@ instance (Pretty a) => Show (ReadError a) where
         , ""
         , "The type was the following:"
         , ""
-        , "↳ " <> (pretty $ Dhall.expected typ)
+        , "↳ " <> pretty (Dhall.expected typ)
         , ""
         , "And the expression was the following:"
         , ""

@@ -1,14 +1,14 @@
 module Spago.Messages where
 
-import Spago.Prelude
+import           Spago.Prelude
 
-import qualified Data.Text as Text
-
+import qualified Data.List.NonEmpty as NonEmpty
+import qualified Data.Text          as Text
 
 failedToParseLocalRepo :: Text -> Text
 failedToParseLocalRepo spagoConfigPath = makeMessage
-  [ "ERROR: your when importing local packages you should point to their `spago.dhall` file."
-  , "However, the following local package is not: " <> surroundQuote spagoConfigPath
+  [ "ERROR: when importing local packages you should point to their `spago.dhall` file."
+  , "However, the following local package points to: " <> surroundQuote spagoConfigPath
   ]
 
 cannotFindConfigLocalPackage :: Text -> Text
@@ -132,13 +132,13 @@ failedToReachGitHub err = makeMessage
   , tshow err
   ]
 
-failedToAddDeps :: [Text] -> Text
+failedToAddDeps :: NonEmpty Text -> Text
 failedToAddDeps pkgs = makeMessage $
   [ "Some of the dependencies you tried to add were not found in the package-set."
   , "Not adding any new dependencies to your new spago config."
   , "We didn't find:"
   ]
-  <> map ((<>) "- ") pkgs
+  <> map ("- " <>) (NonEmpty.toList pkgs)
   <> [""]
 
 upgradingPackageSet :: Text -> Text
@@ -150,6 +150,11 @@ upgradingPackageSet newTag = makeMessage
 freezePackageSet :: Text
 freezePackageSet = makeMessage
   [ "Generating new hashes for the package set file so it will be cached.. (this might take some time)"
+  ]
+
+failedToCheckPackageSetFrozen :: Text
+failedToCheckPackageSetFrozen = makeMessage
+  [ "WARNING: wasn't able to check if your package set import is frozen"
   ]
 
 failedToCopyToGlobalCache :: Show a => a -> Text
@@ -179,10 +184,20 @@ pursVersionMismatch currentVersion minVersion = makeMessage
   , "There are a few ways to solve this:"
   , "- install a compatible `purs` version (i.e. in the same 'semver range' as the one in the package set)"
   , "- if the `purs` version is 'too new', you can try using `spago upgrade-set` to upgrade to the latest package set"
-  , "- if you know what you're doing and you want to void this check, you can override the `version` of the `metadata` package in the packages.dhall:"
+  , "- if you know what you're doing and you want to avoid this check, you can override the `version` of the `metadata` package in the packages.dhall:"
   , ""
   , "  let overrides = { metadata = upstream.metadata // { version = \"v" <> currentVersion <> "\" } }"
   , ""
+  ]
+
+getNewGitHubToken :: Text
+getNewGitHubToken = makeMessage
+  [ "Please obtain a GitHub personal access token at:"
+  , "  https://github.com/settings/tokens/new"
+  , "No scopes are required, so don't check any of the boxes."
+  , ""
+  , "After you've done that, assign it to the " <> githubTokenEnvVar <> " environment variable,"
+  , "and then call `spago login` again so Spago can pick it up and save it to cache"
   ]
 
 verifying :: Show a => a -> Text
@@ -195,6 +210,10 @@ bundleCommandRenamed =
 makeModuleCommandRenamed :: Text
 makeModuleCommandRenamed =
   "The `make-module` command has been replaced with `bundle-module`, so use that instead."
+
+globsDoNotMatchWhenWatching :: NonEmpty Text -> Text
+globsDoNotMatchWhenWatching patterns = makeMessage $
+  "WARNING: No matches found when trying to watch the following directories: " : NonEmpty.toList patterns
 
 makeMessage :: [Text] -> Text
 makeMessage = Text.intercalate "\n"

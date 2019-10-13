@@ -4,42 +4,39 @@ module Spago.PackageSet
   , makePackageSetFile
   , freeze
   , ensureFrozen
-  , path
+  , packagesPath
+  , findRootOutputPath
   ) where
 
 import           Spago.Prelude
 
-import qualified Control.Retry       as Retry
-import qualified Data.Text           as Text
-import qualified Data.Text.Encoding  as Text
-import qualified Data.Versions       as Version
-import           Dhall.Binary        (defaultStandardVersion)
+import           Data.Ord        (comparing)
+import qualified Data.Text       as Text
+import qualified Data.Versions   as Version
 import qualified Dhall.Freeze
 import qualified Dhall.Pretty
-import qualified GitHub
-import qualified Network.HTTP.Client as Http
-import qualified Network.HTTP.Simple as Http
+import qualified Safe
 
-import qualified Spago.Dhall         as Dhall
-import qualified Spago.GlobalCache   as GlobalCache
-import           Spago.Messages      as Messages
-import qualified Spago.Purs          as Purs
-import qualified Spago.Templates     as Templates
-import           Spago.Types         ()
+import qualified Spago.Dhall     as Dhall
+import qualified Spago.GitHub    as GitHub
+import           Spago.Messages  as Messages
+import qualified Spago.Purs      as Purs
+import qualified Spago.Templates as Templates
+import qualified System.FilePath
+import qualified System.IO
 
-
-path :: IsString t => t
-path = "packages.dhall"
+packagesPath :: IsString t => t
+packagesPath = "packages.dhall"
 
 
 -- | Tries to create the `packages.dhall` file if needed
-makePackageSetFile :: Spago m => Bool -> m ()
-makePackageSetFile force = do
-  hasPackagesDhall <- testfile path
+makePackageSetFile :: Spago m => Bool -> Dhall.TemplateComments -> m ()
+makePackageSetFile force comments = do
+  hasPackagesDhall <- testfile packagesPath
   if force || not hasPackagesDhall
-    then writeTextFile path Templates.packagesDhall
-    else echo $ Messages.foundExistingProject path
-  Dhall.format path
+    then writeTextFile packagesPath $ Dhall.processComments comments Templates.packagesDhall
+    else echo $ Messages.foundExistingProject packagesPath
+  Dhall.format packagesPath
 
 
 -- | Tries to upgrade the Package-Sets release of the local package set.
@@ -53,24 +50,10 @@ upgradePackageSet :: Spago m => m ()
 upgradePackageSet = do
   echoDebug "Running `spago upgrade-set`"
 
-  globalCacheDir <- GlobalCache.getGlobalCacheDir
-  assertDirectory globalCacheDir
-  let globalPathToCachedTag = globalCacheDir </> "package-sets-tag.txt"
-  let writeTagCache releaseTagName = writeTextFile (Text.pack globalPathToCachedTag) releaseTagName
-  let readTagCache = try $ readTextFile $ pathFromText $ Text.pack globalPathToCachedTag
-  let downloadTagToCache =
-        try (Retry.recoverAll (Retry.fullJitterBackoff 50000 <> Retry.limitRetries 5) $ \_ -> getLatestRelease1 <|> getLatestRelease2) >>= \case
-          Left (err :: SomeException) -> echoDebug $ Messages.failedToReachGitHub err
-          Right releaseTagName -> writeTagCache releaseTagName
-
-  shouldRefreshFile globalPathToCachedTag >>= \case
-    True -> downloadTagToCache
-    False -> pure ()
-
-  readTagCache >>= \case
+  GitHub.getLatestPackageSetsTag >>= \case
     Right tag -> updateTag tag
     Left (err :: SomeException) -> do
-      echo "WARNING: was not possible to upgrate the package-sets release"
+      echo "WARNING: was not possible to upgrade the package-sets release"
       echoDebug $ "Error: " <> tshow err
 
   where
@@ -78,44 +61,21 @@ upgradePackageSet = do
     updateTag releaseTagName =  do
       let quotedTag = surroundQuote releaseTagName
       echoDebug $ "Found the most recent tag for \"purescript/package-sets\": " <> quotedTag
-      rawPackageSet <- liftIO $ Dhall.readRawExpr path
+      rawPackageSet <- liftIO $ Dhall.readRawExpr packagesPath
       case rawPackageSet of
         Nothing -> die Messages.cannotFindPackages
         -- Skip the check if the tag is already the newest
         Just (_, expr)
-          | (currentTag:_) <- (foldMap getCurrentTag expr)
+          | (currentTag:_) <- foldMap getCurrentTag expr
           , currentTag == releaseTagName
             -> echo $ "Skipping package set version upgrade, already on latest version: " <> quotedTag
         Just (header, expr) -> do
           echo $ "Upgrading the package set version to " <> quotedTag
           let newExpr = fmap (upgradeImports releaseTagName) expr
           echo $ Messages.upgradingPackageSet releaseTagName
-          liftIO $ Dhall.writeRawExpr path (header, newExpr)
+          liftIO $ Dhall.writeRawExpr packagesPath (header, newExpr)
           -- If everything is fine, refreeze the imports
-          freeze
-
-    -- | The idea here is that we go to the `latest` endpoint, and then get redirected
-    --   to the latest release. So we search for the `Location` header which should contain
-    --   the URL we get redirected to, and strip the release name from there (it's the
-    --   last segment of the URL)
-    getLatestRelease1 :: Spago m => m Text
-    getLatestRelease1 = do
-      request <- Http.parseRequest "https://github.com/purescript/package-sets/releases/latest"
-      response <- Http.httpBS
-        $ Http.addRequestHeader "User-Agent" "Mozilla/5.0"
-        $ request { Http.redirectCount = 0 }
-      case Http.getResponseHeader "Location" response of
-        [redirectUrl] -> return $ last $ Text.splitOn "/" $ Text.decodeUtf8 redirectUrl
-        _ -> do
-          echoStr $ "Error following GitHub redirect, response:\n\n" <> show response
-          empty
-
-    getLatestRelease2 :: Spago m => m Text
-    getLatestRelease2 = do
-      result <- liftIO $ GitHub.executeRequest' $ GitHub.latestReleaseR "purescript" "package-sets"
-      case result of
-        Right GitHub.Release{..} -> return releaseTagName
-        Left _                   -> empty
+          freeze packagesPath
 
     getCurrentTag :: Dhall.Import -> [Text]
     getCurrentTag Dhall.Import
@@ -246,6 +206,7 @@ isRemoteFrozen :: Dhall.Import -> [Bool]
 isRemoteFrozen (Dhall.Import
   { importHashed = Dhall.ImportHashed
     { importType = Dhall.Remote _
+    , hash
     , ..
     }
   , ..
@@ -253,9 +214,41 @@ isRemoteFrozen (Dhall.Import
 isRemoteFrozen _ = []
 
 
+localImportPath :: Dhall.Import -> Maybe System.IO.FilePath
+localImportPath (Dhall.Import
+  { importHashed = Dhall.ImportHashed
+    { importType = localImport@(Dhall.Local _ _)
+    }
+  })              = Just $ Text.unpack $ pretty localImport
+localImportPath _ = Nothing
+
+
+rootPackagePath :: Dhall.Import -> Maybe System.IO.FilePath
+rootPackagePath (Dhall.Import
+  { importHashed = Dhall.ImportHashed
+    { importType = localImport@(Dhall.Local _ Dhall.File { file = "packages.dhall" })
+    }
+  , Dhall.importMode = Dhall.Code
+  })              = Just $ Text.unpack $ pretty localImport
+rootPackagePath _ = Nothing
+
+
+-- | In a Monorepo we don't wish to rebuild our shared packages over and over,
+-- | so we build into an output folder where our root packages.dhall lives
+findRootOutputPath :: Spago m => System.IO.FilePath -> m (Maybe System.IO.FilePath)
+findRootOutputPath path = do
+  echoDebug "Locating root path of packages.dhall"
+  imports <- liftIO $ Dhall.readImports $ Text.pack path
+  let localImports = mapMaybe rootPackagePath imports
+  pure $ flip System.FilePath.replaceFileName "output" <$> findRootPath localImports
+
+-- | Given a list of filepaths, find the one with the least folders
+findRootPath :: [System.IO.FilePath] -> Maybe System.IO.FilePath
+findRootPath = Safe.minimumByMay (comparing (length . System.FilePath.splitSearchPath))
+
 -- | Freeze the package set remote imports so they will be cached
-freeze :: Spago m => m ()
-freeze = do
+freeze :: Spago m => System.IO.FilePath -> m ()
+freeze path = do
   echo Messages.freezePackageSet
   liftIO $
     Dhall.Freeze.freeze
@@ -263,17 +256,15 @@ freeze = do
       Dhall.Freeze.OnlyRemoteImports
       Dhall.Freeze.Secure
       Dhall.Pretty.ASCII
-      defaultStandardVersion
 
 
 -- | Freeze the file if any of the remote imports are not frozen
-ensureFrozen :: Spago m => m ()
-ensureFrozen = do
+ensureFrozen :: Spago m => System.IO.FilePath -> m ()
+ensureFrozen path = do
   echoDebug "Ensuring that the package set is frozen"
-  rawPackageSet <- liftIO $ Dhall.readRawExpr path
-  case rawPackageSet of
-    Nothing -> echo "WARNING: wasn't able to check if your package set file is frozen"
-    Just (_header, expr) -> do
-      let areRemotesFrozen = foldMap isRemoteFrozen expr
-      unless (and areRemotesFrozen) $ do
-        freeze
+  imports <- liftIO $ Dhall.readImports $ Text.pack path
+  let areRemotesFrozen = foldMap isRemoteFrozen imports
+  case areRemotesFrozen of
+    []      -> echo Messages.failedToCheckPackageSetFrozen
+    remotes -> unless (and remotes) $
+      traverse_ (maybe (pure ()) freeze . localImportPath) imports

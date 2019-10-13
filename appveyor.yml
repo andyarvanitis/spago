@@ -6,7 +6,7 @@ branches:
 
 environment:
   STACK_ROOT: C:\sr
-  STACK_VERSION: 1.9.3
+  STACK_VERSION: 2.1.1
 
   # Workaround a gnarly bug https://github.com/haskell/cabal/issues/5386
   # See: https://www.fpcomplete.com/blog/2018/06/sed-a-debugging-story
@@ -23,7 +23,7 @@ install:
   - npm install -g bower
   - ps: |
       $releases = "https://api.github.com/repos/purescript/purescript/releases"
-      $tag = "v0.13.2"
+      $tag = "v0.13.3"
       $download = "https://github.com/purescript/purescript/releases/download/$tag/win64.tar.gz"
       Invoke-WebRequest $download -Out purescript.tar.gz
   - tar -xvf purescript.tar.gz

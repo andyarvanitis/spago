@@ -4,12 +4,14 @@ import           Control.Concurrent (threadDelay)
 import qualified Data.Text          as Text
 import           Prelude            hiding (FilePath)
 import qualified System.IO.Temp     as Temp
-import           Test.Hspec         (Spec, around_, describe, it, shouldBe)
+import           Test.Hspec         (Spec, around_, describe, it, shouldBe, shouldNotSatisfy,
+                                     shouldReturn, shouldSatisfy)
 import           Turtle             (ExitCode (..), cd, cp, decodeString, empty, mkdir, mktree, mv,
-                                     readTextFile, rm, shell, testdir, writeTextFile, shellStrictWithErr)
-import           Utils              (checkFixture, readFixture, runFor, shouldBeFailure,
-                                     shouldBeFailureOutput, shouldBeSuccess, shouldBeSuccessOutput,
-                                     spago, withCwd)
+                                     readTextFile, rm, shell, shellStrictWithErr, testdir,
+                                     writeTextFile)
+import           Utils              (checkFileHasInfix, checkFixture, readFixture, runFor,
+                                     shouldBeFailure, shouldBeFailureOutput, shouldBeSuccess,
+                                     shouldBeSuccessOutput, spago, withCwd)
 
 
 setup :: IO () -> IO ()
@@ -37,7 +39,7 @@ spec = around_ setup $ do
       mktree "src"
       writeTextFile "src/Main.purs" "Something"
       spago ["init"] >>= shouldBeSuccess
-      readTextFile "src/Main.purs" >>= (`shouldBe` "Something")
+      readTextFile "src/Main.purs" `shouldReturn` "Something"
 
     it "Spago should always succeed in doing init with force" $ do
 
@@ -66,6 +68,18 @@ spec = around_ setup $ do
       mv "spago.dhall" "spago-bower-import.dhall"
       checkFixture "spago-bower-import.dhall"
 
+    it "Spago should strip comments from spago.dhall and packages.dhall" $ do
+
+      spago ["init", "--no-comments"] >>= shouldBeSuccess
+
+      cp "spago.dhall" "spago-no-comments.dhall"
+      checkFixture "spago-no-comments.dhall"
+
+      -- We don't want fixture for packages.dhall to avoid having to maintain upstream package-set URL in fixture
+      dhallSource <- readTextFile "packages.dhall"
+      dhallSource `shouldNotSatisfy` (Text.isInfixOf "{-") -- comments not present
+      dhallSource `shouldSatisfy` (Text.isInfixOf "let overrides = {=}") -- some dhall stuff is present
+
   describe "spago install" $ do
 
     it "Subsequent installs should succeed after failed install" $ do
@@ -76,6 +90,20 @@ spec = around_ setup $ do
       -- Sleep for some time, as the above might take time to cleanup old processes
       threadDelay 1000000
       spago ["install", "-j", "10"] >>= shouldBeSuccess
+
+    it "Spago should warn that config was not changed, when trying to install package already present in project dependencies" $ do
+
+      spago ["init"] >>= shouldBeSuccess
+      spago ["install"] >>= shouldBeSuccess
+      spago ["install", "effect"] >>= shouldBeSuccessOutput "spago-install-existing-dep-warning.txt"
+
+    it "Spago should strip 'purescript-' prefix and give warning if package without prefix is present in package set" $ do
+
+      spago ["init"] >>= shouldBeSuccess
+      spago ["install"] >>= shouldBeSuccess
+      spago ["install", "purescript-newtype"] >>= shouldBeSuccessOutput "spago-install-purescript-prefix-warning.txt"
+      -- dep added without "purescript-" prefix
+      checkFileHasInfix "spago.dhall" "\"newtype\""
 
     it "Spago should be able to add dependencies" $ do
 
@@ -179,12 +207,39 @@ spec = around_ setup $ do
 
       spago ["install"] >>= shouldBeSuccess
 
+    it "Spago should not warn about freezing remote imports with the default setup" $ do
+
+      spago ["init"] >>= shouldBeSuccess
+      -- Do an initial installation so that it's easier to compare subsequent output
+      spago ["install"] >>= shouldBeSuccess
+      spago ["install"] >>= shouldBeSuccessOutput "ensure-frozen-success.txt"
+
+    it "Spago should not warn about freezing remote imports if they can be located from spago.dhall" $ do
+
+      spago ["init"] >>= shouldBeSuccess
+      -- Do an initial installation so that it's easier to compare subsequent output
+      spago ["install"] >>= shouldBeSuccess
+
+      mkdir "elsewhere"
+      writeTextFile "elsewhere/a.dhall" "let p = ./b.dhall in p"
+      mv "packages.dhall" "elsewhere/b.dhall"
+      spagoDhall <- readTextFile "spago.dhall"
+      writeTextFile "spago.dhall" $ Text.replace "./packages.dhall" "./elsewhere/a.dhall" spagoDhall
+      spago ["install"] >>= shouldBeSuccessOutput "ensure-frozen-success.txt"
+
   describe "spago sources" $ do
 
     it "Spago should print both dependencies and project sources" $ do
 
       spago ["init"] >>= shouldBeSuccess
       spago ["sources"] >>= shouldBeSuccessOutput "sources-output.txt"
+
+  -- -- This is currently commented because it requires a GitHub token and Travis makes it hard to do it securely
+  -- describe "spago login" $ do
+  --
+  --  it "Spago should login correctly" $ do
+  --
+  --    spago ["login"] >>= shouldBeSuccessOutput "login-output.txt"
 
   describe "spago build" $ do
 
@@ -197,13 +252,13 @@ spec = around_ setup $ do
 
       spago ["init"] >>= shouldBeSuccess
       spago ["build", "--purs-args", "-o myOutput"] >>= shouldBeSuccess
-      testdir "myOutput" >>= (`shouldBe` True)
+      testdir "myOutput" `shouldReturn` True
 
     it "Spago should pass multiple options to purs" $ do
 
       spago ["init"] >>= shouldBeSuccess
       spago ["build", "--purs-args", "-o", "--purs-args", "myOutput"] >>= shouldBeSuccess
-      testdir "myOutput" >>= (`shouldBe` True)
+      testdir "myOutput" `shouldReturn` True
 
     it "Spago should build successfully with sources included from custom path" $ do
 
@@ -231,6 +286,152 @@ spec = around_ setup $ do
       mv "spago.dhall" "spago-configV2.dhall"
       checkFixture "spago-configV2.dhall"
 
+    it "Spago should create a local output folder when we are using --no-share-output" $ do
+
+      -- Create root-level packages.dhall
+      mkdir "monorepo"
+      cd "monorepo"
+      spago ["init"] >>= shouldBeSuccess
+      rm "spago.dhall"
+
+      -- Create local 'lib-a' package that uses packages.dhall on top level (but also has it's own one to confuse things)
+      mkdir "lib-a"
+      cd "lib-a"
+      spago ["init"] >>= shouldBeSuccess
+      rm "spago.dhall"
+      writeTextFile "spago.dhall" $ "{ name = \"lib-1\", dependencies = [\"console\", \"effect\", \"prelude\"], packages = ./packages.dhall }"
+      rm "packages.dhall"
+      writeTextFile "packages.dhall" $ "../packages.dhall"
+      spago ["build", "--no-share-output"] >>= shouldBeSuccess
+      testdir "output" `shouldReturn` True
+
+      cd ".."
+      testdir "output" `shouldReturn` False
+
+    it "Spago should use the main packages.dhall even when another packages.dhall is further up the tree" $ do
+
+      -- Create root-level packages.dhall that directs to middle one
+      mkdir "monorepo-1"
+      cd "monorepo-1"
+      spago ["init"] >>= shouldBeSuccess
+      rm "spago.dhall"
+      rm "packages.dhall"
+      writeTextFile "packages.dhall" $ "./monorepo-2/packages.dhall"
+
+      -- Create local 'monorepo-2' package that is the real root
+      mkdir "monorepo-2"
+      cd "monorepo-2"
+      spago ["init"] >>= shouldBeSuccess
+      rm "spago.dhall"
+      writeTextFile "spago.dhall" $ "{ name = \"lib-1\", dependencies = [\"console\", \"effect\", \"prelude\"], packages = ./packages.dhall }"
+      spago ["build", "--no-share-output"] >>= shouldBeSuccess
+      testdir "output" `shouldReturn` True
+
+       -- Create local 'monorepo-3' package that uses packages.dhall on top level
+      mkdir "monorepo-3"
+      cd "monorepo-3"
+      spago ["init"] >>= shouldBeSuccess
+      rm "spago.dhall"
+      writeTextFile "spago.dhall" $ "{ name = \"lib-1\", dependencies = [\"console\", \"effect\", \"prelude\"], packages = ./packages.dhall }"
+      rm "packages.dhall"
+      writeTextFile "packages.dhall" $ "../../packages.dhall"
+      spago ["build"] >>= shouldBeSuccess
+      testdir "output" `shouldReturn` False
+
+      cd ".."
+      testdir "output" `shouldReturn` True
+
+      cd ".."
+      testdir "output" `shouldReturn` False
+
+    it "Spago should find the middle packages.dhall even when another file is further up the tree" $ do
+
+      -- Create root-level module to confuse things
+      mkdir "monorepo-root"
+      cd "monorepo-root"
+      spago ["init"] >>= shouldBeSuccess
+      rm "spago.dhall"
+      writeTextFile "spago.dhall" $ "{ name = \"lib-extra\", dependencies = [\"console\", \"effect\", \"prelude\"], packages = ./packages.dhall }"
+
+      -- get rid of duplicate Main module
+      cd "src"
+      rm "Main.purs"
+      writeTextFile "Main.purs" $ "module OtherMain where \n import Prelude\n import Effect\n main :: Effect Unit\n main = pure unit"
+      cd ".."
+
+      -- create real root
+      mkdir "subfolder"
+      cd "subfolder"
+      spago ["init"] >>= shouldBeSuccess
+      packageDhall <- readTextFile "packages.dhall"
+      writeTextFile "packages.dhall" $ packageDhall <> " // { lib-extra = ../spago.dhall as Location }"
+
+      -- Create local 'lib-a' package that uses packages.dhall in middle folder
+      mkdir "lib-a"
+      cd "lib-a"
+      spago ["init"] >>= shouldBeSuccess
+      rm "spago.dhall"
+      writeTextFile "spago.dhall" $ "{ name = \"lib-1\", dependencies = [\"lib-extra\",\"console\", \"effect\", \"prelude\"], packages = ../packages.dhall }"
+      rm "packages.dhall"
+      spago ["build"] >>= shouldBeSuccess
+
+      -- don't use nested folder
+      testdir "output" `shouldReturn` False
+
+      -- use middle one
+      cd ".."
+      testdir "output" `shouldReturn` True
+
+      -- not the trick root folder
+      cd ".."
+      testdir "output" `shouldReturn` False
+
+    it "Spago should create an output folder in the root when we are not passing --no-share-output" $ do
+
+      -- Create root-level packages.dhall
+      mkdir "monorepo2"
+      cd "monorepo2"
+      spago ["init"] >>= shouldBeSuccess
+      rm "spago.dhall"
+
+      -- Create local 'lib-a' package that uses packages.dhall on top level (but also has it's own one to confuse things)
+      mkdir "lib-a"
+      cd "lib-a"
+      spago ["init"] >>= shouldBeSuccess
+      rm "packages.dhall"
+      writeTextFile "packages.dhall" $ "../packages.dhall"
+      rm "spago.dhall"
+      writeTextFile "spago.dhall" $ "{ name = \"lib-1\", dependencies = [\"console\", \"effect\", \"prelude\"], packages = ./packages.dhall }"
+      spago ["build"] >>= shouldBeSuccess
+      testdir "output" `shouldReturn` False
+
+      cd ".."
+      testdir "output" `shouldReturn` True
+
+    describe "alternate backend" $ do
+
+      it "Spago should use alternate backend if option is specified" $ do
+        configWithBackend <- readFixture "spago-configWithBackend.dhall"
+        spago ["init"] >>= shouldBeSuccess
+        mv "spago.dhall" "spago-old.dhall"
+        writeTextFile "spago.dhall" configWithBackend
+
+        spago ["build"] >>= shouldBeSuccess
+
+        checkFixture "alternate-backend-output.txt"
+
+      it "Passing `--codegen corefn` with backend option should fail" $ do
+        configWithBackend <- readFixture "spago-configWithBackend.dhall"
+        spago ["init"] >>= shouldBeSuccess
+        mv "spago.dhall" "spago-old.dhall"
+        writeTextFile "spago.dhall" configWithBackend
+
+        spago ["build"] >>= shouldBeSuccess
+        spago ["build", "--purs-args", "--codegen", "--purs-args", "corefn"] >>= shouldBeFailureOutput "codegen-opt-with-backend.txt"
+        spago ["build", "--purs-args", "--codegen", "--purs-args", "docs"] >>= shouldBeFailureOutput "codegen-opt-with-backend.txt"
+
+
+
   describe "spago test" $ do
 
     it "Spago should test successfully" $ do
@@ -240,6 +441,56 @@ spec = around_ setup $ do
       spago ["build"] >>= shouldBeSuccess
       spago ["build"] >>= shouldBeSuccess
       spago ["test"] >>= shouldBeSuccessOutput "test-output.txt"
+
+    it "Spago should test in custom output folder" $ do
+
+      spago ["init"] >>= shouldBeSuccess
+      spago ["test", "--purs-args", "-o", "--purs-args", "myOutput"] >>= shouldBeSuccess
+      testdir "myOutput" `shouldReturn` True
+
+    it "Spago should test successfully with a different output folder" $ do
+
+      -- Create root-level packages.dhall
+      mkdir "monorepo"
+      cd "monorepo"
+      spago ["init"] >>= shouldBeSuccess
+      rm "spago.dhall"
+
+      -- Create local 'lib-a' package that uses packages.dhall on top level (but also has it's own one to confuse things)
+      mkdir "lib-a"
+      cd "lib-a"
+      spago ["init"] >>= shouldBeSuccess
+      rm "spago.dhall"
+      writeTextFile "spago.dhall" $ "{ name = \"lib-1\", dependencies = [\"console\", \"effect\", \"prelude\"], packages = ./packages.dhall }"
+      rm "packages.dhall"
+      writeTextFile "packages.dhall" $ "../packages.dhall"
+      spago ["test"] >>= shouldBeSuccess
+      testdir "output" `shouldReturn` False
+
+      cd ".."
+      testdir "output" `shouldReturn` True
+
+    it "Spago should test successfully with --no-share-output" $ do
+
+      -- Create root-level packages.dhall
+      mkdir "monorepo"
+      cd "monorepo"
+      spago ["init"] >>= shouldBeSuccess
+      rm "spago.dhall"
+
+      -- Create local 'lib-a' package that uses packages.dhall on top level (but also has it's own one to confuse things)
+      mkdir "lib-a"
+      cd "lib-a"
+      spago ["init"] >>= shouldBeSuccess
+      rm "spago.dhall"
+      writeTextFile "spago.dhall" $ "{ name = \"lib-1\", dependencies = [\"console\", \"effect\", \"prelude\"], packages = ./packages.dhall }"
+      rm "packages.dhall"
+      writeTextFile "packages.dhall" $ "../packages.dhall"
+      spago ["test", "--no-share-output"] >>= shouldBeSuccess
+      testdir "output" `shouldReturn` True
+
+      cd ".."
+      testdir "output" `shouldReturn` False
 
 
   describe "spago upgrade-set" $ do
@@ -255,7 +506,7 @@ spec = around_ setup $ do
             $ Text.lines packages
       writeTextFile "packages.dhall" "https://raw.githubusercontent.com/purescript/package-sets/psc-0.13.0-20190713/src/packages.dhall sha256:906af79ba3aec7f429b107fd8d12e8a29426db8229d228c6f992b58151e2308e"
       spago ["-v", "upgrade-set"] >>= shouldBeSuccess
-      newPackages <- fmap Text.strip $ readTextFile "packages.dhall"
+      newPackages <- Text.strip <$> readTextFile "packages.dhall"
       newPackages `shouldBe` packageSetUrl
 
 

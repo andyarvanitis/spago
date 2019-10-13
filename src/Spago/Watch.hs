@@ -9,10 +9,11 @@ import           Spago.Prelude          hiding (FilePath)
 import           Control.Concurrent.STM (check)
 import qualified Data.Map.Strict        as Map
 import qualified Data.Set               as Set
-import qualified Data.Text              as Text
+import           Data.Text              (pack, toLower, unpack)
 import           GHC.IO                 (FilePath)
 import           GHC.IO.Exception
 import           System.Console.ANSI    (clearScreen)
+import           System.FilePath        (splitDirectories)
 import qualified System.FilePath.Glob   as Glob
 import qualified System.FSNotify        as Watch
 import           System.IO              (getLine)
@@ -79,11 +80,10 @@ fileWatchConf watchConfig shouldClear inner = withManagerConf watchConfig $ \man
             -- and the last event either has different path, or has happened
             -- more than `debounceTime` seconds ago.
             let shouldRebuild =
-                  ( or (matches <$> Set.toList globs)
+                   any matches globs
                  && ( lastPath /= Watch.eventPath event
                    || diffUTCTime timeNow lastTime > debounceTime
                     )
-                  )
 
             when shouldRebuild
               (writeTVar dirtyVar True)
@@ -128,14 +128,15 @@ fileWatchConf watchConfig shouldClear inner = withManagerConf watchConfig $ \man
               return Nothing
 
             startListening = Map.mapWithKey $ \dir () -> do
-              listen <- Watch.watchTree manager dir (const True) $ onChange
+              listen <- Watch.watchTree manager dir (const True) onChange
               return $ Just listen
 
     let watchInput :: Spago m => m ()
         watchInput = do
-          line <- liftIO $ getLine
-          unless (line == "quit") $ liftIO $ do
-            case line of
+          line <- liftIO $ unpack . toLower . pack <$> getLine
+          if line == "quit" then echo "Leaving watch mode."
+          else do
+            liftIO $ case line of
               "help" -> do
                 echo ""
                 echo "help: display this help"
@@ -156,8 +157,7 @@ fileWatchConf watchConfig shouldClear inner = withManagerConf watchConfig $ \man
                   , show line
                   , ". Try 'help'"
                   ]
-
-          watchInput
+            watchInput
 
     race_ watchInput $ forever $ do
       liftIO $ atomically $ do
@@ -175,15 +175,9 @@ fileWatchConf watchConfig shouldClear inner = withManagerConf watchConfig $ \man
 
 
 globToParent :: Glob.Pattern -> FilePath
-globToParent glob = go base $ map Text.unpack pathComponents
+globToParent glob = go pathHead pathRest
   where
-    path = Glob.decompile glob
-
-    base = case isAbsolute path of
-      True  -> [pathSeparator]
-      False -> "."
-
-    pathComponents = Text.split (== pathSeparator) $ Text.pack path
+    pathHead : pathRest = splitDirectories $ Glob.decompile glob
 
     go acc []           = acc
     go acc ("*":_rest)  = acc
